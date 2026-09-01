@@ -267,14 +267,28 @@ defmodule SymphonyElixir.Config.Schema do
       field(:dashboard_enabled, :boolean, default: true)
       field(:refresh_ms, :integer, default: 1_000)
       field(:render_interval_ms, :integer, default: 16)
+      field(:delivery_repository, :string)
+      field(:delivery_history_refresh_ms, :integer, default: 300_000)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:dashboard_enabled, :refresh_ms, :render_interval_ms], empty_values: [])
+      |> cast(
+        attrs,
+        [
+          :dashboard_enabled,
+          :refresh_ms,
+          :render_interval_ms,
+          :delivery_repository,
+          :delivery_history_refresh_ms
+        ],
+        empty_values: []
+      )
       |> validate_number(:refresh_ms, greater_than: 0)
       |> validate_number(:render_interval_ms, greater_than: 0)
+      |> validate_number(:delivery_history_refresh_ms, greater_than: 0)
+      |> validate_format(:delivery_repository, ~r/\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\z/)
     end
   end
 

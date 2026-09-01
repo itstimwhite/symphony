@@ -133,6 +133,9 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+observability:
+  delivery_repository: your-org/your-repo
+  delivery_history_refresh_ms: 300000
 ---
 
 You are working on an issue from the configured tracker {{ issue.identifier }}.
@@ -202,6 +205,17 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- The terminal dashboard keeps the tracker identifier and title separate from the current agent
+  action. Lifecycle labels are evidence-backed summaries of the current event; they never infer a
+  landed state from an agent turn completing.
+- `observability.delivery_repository` optionally adds a read-only recent-landings section for a
+  public GitHub `owner/repository`. Only pull requests with GitHub-native `merged_at` evidence are
+  labeled `Landed`; source, CI, deployment, runtime, and dogfood proof remain separate fields.
+  `observability.delivery_history_refresh_ms` controls the background refresh interval and defaults
+  to five minutes. Fetch failures preserve the last good view and do not block orchestration.
+- Release builders can embed immutable artifact provenance with `SYMPHONY_SOURCE_SHA`,
+  `SYMPHONY_BUILD_ID`, and `SYMPHONY_BUILD_TIMESTAMP`. Missing values are shown as `unknown` rather
+  than inferred from a mutable runtime checkout.
 
 ### Linear adapter profile
 

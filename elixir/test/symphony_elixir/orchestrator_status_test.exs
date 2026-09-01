@@ -1514,6 +1514,48 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute plain =~ " notification "
   end
 
+  test "orchestrator snapshot preserves the stable issue title" do
+    issue_id = "issue-title-snapshot"
+    orchestrator_name = Module.concat(__MODULE__, :IssueTitleSnapshotOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "JOV-5721",
+      title: "PR 16561: add live rendered component evaluation",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    :sys.replace_state(pid, fn state ->
+      Map.put(state, :running, %{
+        issue_id => %{
+          pid: self(),
+          ref: make_ref(),
+          identifier: issue.identifier,
+          issue: issue,
+          session_id: "thread-title",
+          codex_app_server_pid: "4242",
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          turn_count: 1,
+          started_at: DateTime.utc_now(),
+          last_codex_timestamp: nil,
+          last_codex_message: nil,
+          last_codex_event: nil
+        }
+      })
+    end)
+
+    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+    assert [%{identifier: "JOV-5721", title: "PR 16561: add live rendered component evaluation"}] = snapshot.running
+  end
+
   test "status dashboard strips ANSI and control bytes from last codex message" do
     payload =
       "cmd: " <>

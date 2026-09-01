@@ -6,7 +6,7 @@ defmodule SymphonyElixir.StatusDashboard do
   use GenServer
   require Logger
 
-  alias SymphonyElixir.{Config, HttpServer}
+  alias SymphonyElixir.{BuildInfo, Config, DeliveryHistory, HttpServer}
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.ObservabilityPubSub
 
@@ -15,16 +15,24 @@ defmodule SymphonyElixir.StatusDashboard do
   @throughput_graph_window_ms 10 * 60 * 1000
   @throughput_graph_columns 24
   @sparkline_blocks ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-  @running_id_width 8
-  @running_stage_width 14
-  @running_pid_width 8
+  @running_id_width 10
+  @running_title_min_width 24
+  @running_title_max_width 64
+  @running_lifecycle_width 14
   @running_age_width 12
-  @running_tokens_width 10
-  @running_session_width 14
-  @running_event_default_width 44
-  @running_event_min_width 12
-  @running_row_chrome_width 10
+  @running_tokens_width 12
+  @running_action_default_width 44
+  @running_action_min_width 20
+  @running_row_chrome_width 5
   @default_terminal_columns 115
+  @lifecycle_action_patterns [
+    {~r/\b(merge queue|queued for merge|queue position)\b/, "Queued"},
+    {~r/\b(dogfood|canary|playwright|live device|browser qa)\b/, "Dogfooding"},
+    {~r/\b(test|tests|testing|verify|verifying|lint|typecheck|check|coverage|build check)\b/, "Verifying"},
+    {~r/\b(edit|editing|patch|write|writing|file change|implement|coding)\b/, "Building"},
+    {~r/\b(preflight|inspect|search|read|diagnos|investigat|audit)\b/, "Preflight"},
+    {~r/\b(plan|planning)\b/, "Planning"}
+  ]
 
   @ansi_reset IO.ANSI.reset()
   @ansi_bold IO.ANSI.bright()
@@ -53,7 +61,11 @@ defmodule SymphonyElixir.StatusDashboard do
     :last_rendered_at_ms,
     :pending_content,
     :flush_timer_ref,
-    :last_snapshot_fingerprint
+    :last_snapshot_fingerprint,
+    :recent_landed,
+    :delivery_repository,
+    :delivery_history_refresh_ms,
+    :delivery_fetch_in_progress
   ]
 
   @type t :: %__MODULE__{
@@ -71,7 +83,11 @@ defmodule SymphonyElixir.StatusDashboard do
           last_rendered_at_ms: integer() | nil,
           pending_content: String.t() | nil,
           flush_timer_ref: reference() | nil,
-          last_snapshot_fingerprint: term() | nil
+          last_snapshot_fingerprint: term() | nil,
+          recent_landed: [map()],
+          delivery_repository: String.t() | nil,
+          delivery_history_refresh_ms: pos_integer(),
+          delivery_fetch_in_progress: boolean()
         }
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -105,6 +121,7 @@ defmodule SymphonyElixir.StatusDashboard do
     render_fun = Keyword.get(opts, :render_fun, &render_to_terminal/1)
     enabled = resolve_override(enabled_override, observability.dashboard_enabled and dashboard_enabled?())
     schedule_tick(refresh_ms, enabled)
+    schedule_delivery_refresh(observability.delivery_repository, 0)
 
     {:ok,
      %__MODULE__{
@@ -122,7 +139,11 @@ defmodule SymphonyElixir.StatusDashboard do
        last_rendered_at_ms: nil,
        pending_content: nil,
        flush_timer_ref: nil,
-       last_snapshot_fingerprint: nil
+       last_snapshot_fingerprint: nil,
+       recent_landed: [],
+       delivery_repository: observability.delivery_repository,
+       delivery_history_refresh_ms: observability.delivery_history_refresh_ms,
+       delivery_fetch_in_progress: false
      }}
   end
 
@@ -132,6 +153,7 @@ defmodule SymphonyElixir.StatusDashboard do
       [
         colorize("╭─ SYMPHONY STATUS", @ansi_bold),
         colorize("│ app_status=offline", @ansi_red),
+        format_artifact_receipt(BuildInfo.current()),
         closing_border()
       ]
       |> Enum.join("\n")
@@ -154,6 +176,30 @@ defmodule SymphonyElixir.StatusDashboard do
 
   def handle_info(:refresh, %{enabled: true} = state), do: {:noreply, maybe_render(refresh_runtime_config(state))}
   def handle_info(:refresh, state), do: {:noreply, state}
+
+  def handle_info(:refresh_delivery, %{delivery_repository: repository, delivery_fetch_in_progress: false} = state)
+      when is_binary(repository) do
+    parent = self()
+
+    Task.start(fn ->
+      send(parent, {:delivery_history_result, DeliveryHistory.fetch(repository)})
+    end)
+
+    {:noreply, %{state | delivery_fetch_in_progress: true}}
+  end
+
+  def handle_info(:refresh_delivery, state), do: {:noreply, state}
+
+  def handle_info({:delivery_history_result, {:ok, recent_landed}}, state) do
+    schedule_delivery_refresh(state.delivery_repository, state.delivery_history_refresh_ms)
+    {:noreply, %{state | recent_landed: recent_landed, delivery_fetch_in_progress: false}}
+  end
+
+  def handle_info({:delivery_history_result, {:error, reason}}, state) do
+    Logger.warning("Failed refreshing native merge history: #{inspect(reason)}")
+    schedule_delivery_refresh(state.delivery_repository, state.delivery_history_refresh_ms)
+    {:noreply, %{state | delivery_fetch_in_progress: false}}
+  end
 
   def handle_info({:flush_render, timer_ref}, %{enabled: true, flush_timer_ref: timer_ref} = state) do
     now_ms = System.monotonic_time(:millisecond)
@@ -183,16 +229,26 @@ defmodule SymphonyElixir.StatusDashboard do
       state
       | enabled: resolve_override(state.enabled_override, observability.dashboard_enabled and dashboard_enabled?()),
         refresh_ms: state.refresh_ms_override || observability.refresh_ms,
-        render_interval_ms: state.render_interval_ms_override || observability.render_interval_ms
+        render_interval_ms: state.render_interval_ms_override || observability.render_interval_ms,
+        delivery_repository: observability.delivery_repository,
+        delivery_history_refresh_ms: observability.delivery_history_refresh_ms
     }
   end
 
   defp schedule_tick(refresh_ms, true), do: Process.send_after(self(), :tick, refresh_ms)
   defp schedule_tick(_refresh_ms, false), do: :ok
 
+  defp schedule_delivery_refresh(repository, delay_ms) when is_binary(repository) and repository != "",
+    do: Process.send_after(self(), :refresh_delivery, delay_ms)
+
+  defp schedule_delivery_refresh(_repository, _delay_ms), do: :ok
+
   defp maybe_render(state) do
     now_ms = System.monotonic_time(:millisecond)
-    {snapshot_data, token_samples} = snapshot_with_samples(state.token_samples, now_ms)
+
+    {snapshot_data, token_samples} =
+      snapshot_with_samples(state.token_samples, now_ms, state.recent_landed)
+
     state = Map.put(state, :token_samples, token_samples)
 
     current_tokens = snapshot_total_tokens(snapshot_data)
@@ -305,7 +361,7 @@ defmodule SymphonyElixir.StatusDashboard do
       %{state | pending_content: nil, flush_timer_ref: nil}
   end
 
-  defp snapshot_with_samples(token_samples, now_ms) do
+  defp snapshot_with_samples(token_samples, now_ms, recent_landed) do
     case snapshot_payload() do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         total_tokens = Map.get(codex_totals, :total_tokens, 0)
@@ -315,6 +371,9 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             blocked: Map.get(snapshot, :blocked, []),
+             recent_landed: recent_landed,
+             artifact: BuildInfo.current(),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -330,7 +389,12 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
-  defp format_snapshot_content(snapshot_data, tps, terminal_columns_override \\ nil) do
+  defp format_snapshot_content(
+         snapshot_data,
+         tps,
+         terminal_columns_override \\ nil,
+         now \\ DateTime.utc_now()
+       ) do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
@@ -342,10 +406,13 @@ defmodule SymphonyElixir.StatusDashboard do
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
         agent_count = length(running)
         max_agents = Config.settings!().agent.max_concurrent_agents
-        running_event_width = running_event_width(terminal_columns_override)
-        running_rows = format_running_rows(running, running_event_width)
+        running_layout = running_layout(terminal_columns_override)
+        running_rows = format_running_rows(running, running_layout)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
+        blocked_rows = format_blocked_rows(Map.get(snapshot, :blocked, []))
+        recent_landed_rows = format_recent_landed_rows(Map.get(snapshot, :recent_landed, []), now)
+        artifact_line = format_artifact_receipt(Map.get(snapshot, :artifact, BuildInfo.current()))
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
@@ -363,17 +430,22 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize(" | ", @ansi_gray) <>
              colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
+           artifact_line,
            project_link_lines,
            project_refresh_line,
            colorize("├─ Running", @ansi_bold),
            "│",
-           running_table_header_row(running_event_width),
-           running_table_separator_row(running_event_width)
+           running_table_header_row(running_layout),
+           running_table_separator_row(running_layout)
          ] ++
            running_rows ++
            running_to_backoff_spacer ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
            backoff_rows ++
+           ["│", colorize("├─ Blocked", @ansi_bold), "│"] ++
+           blocked_rows ++
+           ["│", colorize("├─ Recent landed · native merge proof", @ansi_bold), "│"] ++
+           recent_landed_rows ++
            [closing_border()])
         |> List.flatten()
         |> Enum.join("\n")
@@ -383,6 +455,7 @@ defmodule SymphonyElixir.StatusDashboard do
           colorize("╭─ SYMPHONY STATUS", @ansi_bold),
           colorize("│ Orchestrator snapshot unavailable", @ansi_red),
           colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
+          format_artifact_receipt(BuildInfo.current()),
           format_project_link_lines(),
           format_project_refresh_line(nil),
           closing_border()
@@ -543,6 +616,19 @@ defmodule SymphonyElixir.StatusDashboard do
     do: format_snapshot_content(snapshot_data, tps, terminal_columns)
 
   @doc false
+  @spec format_snapshot_content_for_test(term(), number(), integer() | nil, DateTime.t()) :: String.t()
+  def format_snapshot_content_for_test(snapshot_data, tps, terminal_columns, %DateTime{} = now),
+    do: format_snapshot_content(snapshot_data, tps, terminal_columns, now)
+
+  @doc false
+  @spec format_artifact_receipt_for_test(map()) :: String.t()
+  def format_artifact_receipt_for_test(artifact), do: format_artifact_receipt(artifact)
+
+  @doc false
+  @spec lifecycle_for_test(term(), term(), term()) :: String.t()
+  def lifecycle_for_test(state, event, action), do: lifecycle(state, event, action)
+
+  @doc false
   @spec dashboard_url_for_test(String.t(), non_neg_integer() | nil, non_neg_integer() | nil) ::
           String.t() | nil
   def dashboard_url_for_test(host, configured_port, bound_port),
@@ -554,13 +640,15 @@ defmodule SymphonyElixir.StatusDashboard do
         %{
           running: running,
           retrying: retrying,
+          blocked: blocked,
           codex_totals: codex_totals
         } = snapshot
-        when is_list(running) and is_list(retrying) ->
+        when is_list(running) and is_list(retrying) and is_list(blocked) ->
           {:ok,
            %{
              running: running,
              retrying: retrying,
+             blocked: blocked,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -574,7 +662,7 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
-  defp format_running_rows(running, running_event_width) do
+  defp format_running_rows(running, layout) do
     if running == [] do
       [
         "│  " <> colorize("No active agents", @ansi_gray),
@@ -583,23 +671,23 @@ defmodule SymphonyElixir.StatusDashboard do
     else
       running
       |> Enum.sort_by(& &1.identifier)
-      |> Enum.map(&format_running_summary(&1, running_event_width))
+      |> Enum.map(&format_running_summary(&1, layout))
     end
   end
 
   # credo:disable-for-next-line
-  defp format_running_summary(running_entry, running_event_width) do
+  defp format_running_summary(running_entry, layout) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
-    state = running_entry.state || "unknown"
-    state_display = format_cell(to_string(state), @running_stage_width)
-    session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
-    pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
+    title = format_cell(running_entry[:title] || "(untitled)", layout.title_width)
     total_tokens = running_entry.codex_total_tokens || 0
     runtime_seconds = running_entry.runtime_seconds || 0
     turn_count = Map.get(running_entry, :turn_count, 0)
     age = format_cell(format_runtime_and_turns(runtime_seconds, turn_count), @running_age_width)
     event = running_entry.last_codex_event || "none"
-    event_label = format_cell(summarize_message(running_entry.last_codex_message), running_event_width)
+    action = action_summary(running_entry.last_codex_message)
+    lifecycle = lifecycle(running_entry[:state], event, action)
+    lifecycle_display = format_cell(lifecycle, @running_lifecycle_width)
+    action_label = format_cell(action, layout.action_width)
 
     tokens = format_count(total_tokens) |> format_cell(@running_tokens_width, :right)
 
@@ -618,17 +706,15 @@ defmodule SymphonyElixir.StatusDashboard do
       " ",
       colorize(issue, @ansi_cyan),
       " ",
-      colorize(state_display, status_color),
+      colorize(title, @ansi_bold),
       " ",
-      colorize(pid, @ansi_yellow),
+      colorize(lifecycle_display, status_color),
       " ",
       colorize(age, @ansi_magenta),
       " ",
       colorize(tokens, @ansi_yellow),
       " ",
-      colorize(session, @ansi_cyan),
-      " ",
-      colorize(event_label, status_color)
+      colorize(action_label, status_color)
     ]
     |> Enum.join("")
   end
@@ -636,7 +722,7 @@ defmodule SymphonyElixir.StatusDashboard do
   @doc false
   @spec format_running_summary_for_test(map(), integer() | nil) :: String.t()
   def format_running_summary_for_test(running_entry, terminal_columns \\ nil),
-    do: format_running_summary(running_entry, running_event_width(terminal_columns))
+    do: format_running_summary(running_entry, running_layout(terminal_columns))
 
   @doc false
   @spec format_tps_for_test(number()) :: String.t()
@@ -671,6 +757,138 @@ defmodule SymphonyElixir.StatusDashboard do
       colorize(" in ", @ansi_dim) <>
       colorize(next_in_words(due_in_ms), @ansi_cyan) <>
       error
+  end
+
+  defp format_blocked_rows([]), do: ["│  " <> colorize("No blocked tasks", @ansi_gray)]
+
+  defp format_blocked_rows(blocked) do
+    blocked
+    |> Enum.sort_by(&(&1[:identifier] || &1[:issue_id] || "unknown"))
+    |> Enum.map(fn entry ->
+      identifier = entry[:identifier] || entry[:issue_id] || "unknown"
+      title = entry[:title] || "(untitled)"
+      error = entry[:error] || "blocked without recorded reason"
+
+      "│  #{colorize("■", @ansi_red)} " <>
+        colorize(identifier, @ansi_red) <>
+        " " <>
+        colorize(truncate(title, 64), @ansi_bold) <>
+        colorize(" · ", @ansi_gray) <>
+        colorize(truncate(error, 120), @ansi_dim)
+    end)
+  end
+
+  defp format_recent_landed_rows([], _now),
+    do: ["│  " <> colorize("No native merges observed", @ansi_gray)]
+
+  defp format_recent_landed_rows(recent_landed, now) do
+    recent_landed
+    |> Enum.filter(&match?(%DateTime{}, &1[:merged_at]))
+    |> Enum.sort_by(& &1.merged_at, {:desc, DateTime})
+    |> Enum.take(5)
+    |> Enum.map(fn entry ->
+      "│  " <>
+        colorize(format_cell(entry.identifier, 12), @ansi_cyan) <>
+        " " <>
+        colorize(format_cell(entry.title || "(untitled)", 64), @ansi_bold) <>
+        " " <>
+        colorize(format_cell(entry.disposition || "Landed", 10), @ansi_green) <>
+        " " <>
+        colorize(format_cell(whole_minute_age(entry.merged_at, now), 12), @ansi_magenta) <>
+        " " <>
+        colorize(format_proof_tiers(entry[:proof] || %{}), @ansi_gray)
+    end)
+  end
+
+  defp whole_minute_age(%DateTime{} = timestamp, %DateTime{} = now) do
+    minutes = max(0, div(DateTime.diff(now, timestamp, :second), 60))
+    "#{minutes} min ago"
+  end
+
+  defp format_proof_tiers(proof) do
+    [
+      proof_tier("source", proof[:source]),
+      proof_tier("ci", proof[:ci]),
+      proof_tier("deploy", proof[:deployment]),
+      proof_tier("runtime", proof[:runtime]),
+      proof_tier("dogfood", proof[:dogfood])
+    ]
+    |> Enum.join(" ")
+  end
+
+  defp proof_tier(label, true), do: "#{label}✓"
+  defp proof_tier(label, _value), do: "#{label}—"
+
+  defp format_artifact_receipt(artifact) when is_map(artifact) do
+    name = artifact[:name] || "symphony"
+    version = artifact[:version] || "unknown"
+    source_sha = artifact[:source_sha] || "unknown"
+    build_id = artifact[:build_id] || "unknown"
+    built_at = artifact[:built_at] || "unknown"
+    host = artifact[:host] || "unknown"
+
+    colorize("│ Artifact: ", @ansi_bold) <>
+      colorize("#{name} #{version}", @ansi_cyan) <>
+      colorize(" · source ", @ansi_gray) <>
+      colorize(source_sha, @ansi_yellow) <>
+      colorize(" · build ", @ansi_gray) <>
+      colorize(build_id, @ansi_yellow) <>
+      colorize(" · built ", @ansi_gray) <>
+      colorize(built_at, @ansi_magenta) <>
+      colorize(" · host ", @ansi_gray) <>
+      colorize(host, @ansi_cyan)
+  end
+
+  defp format_artifact_receipt(_artifact),
+    do: colorize("│ Artifact: unavailable", @ansi_gray)
+
+  defp action_summary(nil), do: "Waiting for first event"
+
+  defp action_summary(message) do
+    action = summarize_message(message) |> String.trim()
+
+    case action do
+      "" -> "Waiting for first event"
+      "no codex message yet" -> "Waiting for first event"
+      action -> maybe_prefix_action(message, action)
+    end
+  end
+
+  defp maybe_prefix_action(message, action) do
+    method =
+      map_path(message, [:message, "method"]) ||
+        map_path(message, ["message", "method"]) ||
+        map_path(message, [:message, :method]) ||
+        map_path(message, ["message", :method])
+
+    if method == "codex/event/exec_command_begin" do
+      "command started: #{action}"
+    else
+      action
+    end
+  end
+
+  defp lifecycle(state, event, action) do
+    action = action || "Waiting for first event"
+    state_text = state |> to_string() |> String.downcase()
+    action_text = action |> to_string() |> String.downcase()
+
+    cond do
+      event in [nil, :none, "none"] and action == "Waiting for first event" ->
+        "Bootstrapping"
+
+      state_text == "merging" ->
+        "Queued"
+
+      true ->
+        lifecycle_from_action(action_text)
+    end
+  end
+
+  defp lifecycle_from_action(action_text) do
+    Enum.find_value(@lifecycle_action_patterns, "Active", fn {pattern, lifecycle} ->
+      if Regex.match?(pattern, action_text), do: lifecycle
+    end)
   end
 
   defp next_in_words(due_in_ms) when is_integer(due_in_ms) do
@@ -737,52 +955,44 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_count(value), do: to_string(value)
 
-  defp running_table_header_row(running_event_width) do
+  defp running_table_header_row(layout) do
     header =
       [
         format_cell("ID", @running_id_width),
-        format_cell("STAGE", @running_stage_width),
-        format_cell("PID", @running_pid_width),
+        format_cell("TITLE", layout.title_width),
+        format_cell("LIFECYCLE", @running_lifecycle_width),
         format_cell("AGE / TURN", @running_age_width),
         format_cell("TOKENS", @running_tokens_width),
-        format_cell("SESSION", @running_session_width),
-        format_cell("EVENT", running_event_width)
+        format_cell("ACTION", layout.action_width)
       ]
       |> Enum.join(" ")
 
     "│   " <> colorize(header, @ansi_gray)
   end
 
-  defp running_table_separator_row(running_event_width) do
+  defp running_table_separator_row(layout) do
     separator_width =
       @running_id_width +
-        @running_stage_width +
-        @running_pid_width +
+        layout.title_width +
+        @running_lifecycle_width +
         @running_age_width +
         @running_tokens_width +
-        @running_session_width +
-        running_event_width + 6
+        layout.action_width + 5
 
     "│   " <> colorize(String.duplicate("─", separator_width), @ansi_gray)
   end
 
-  defp running_event_width(terminal_columns) do
+  defp running_layout(terminal_columns) do
     terminal_columns = terminal_columns || terminal_columns()
-
-    max(
-      @running_event_min_width,
-      terminal_columns - fixed_running_width() - @running_row_chrome_width
-    )
+    fixed = fixed_running_width() + @running_row_chrome_width
+    flexible = max(@running_title_min_width + @running_action_min_width, terminal_columns - fixed)
+    title_width = min(@running_title_max_width, max(@running_title_min_width, div(flexible, 3)))
+    action_width = max(@running_action_min_width, terminal_columns - fixed - title_width)
+    %{title_width: title_width, action_width: action_width}
   end
 
-  defp fixed_running_width do
-    @running_id_width +
-      @running_stage_width +
-      @running_pid_width +
-      @running_age_width +
-      @running_tokens_width +
-      @running_session_width
-  end
+  defp fixed_running_width,
+    do: @running_id_width + @running_lifecycle_width + @running_age_width + @running_tokens_width + 4
 
   defp terminal_columns do
     case :io.columns() do
@@ -797,7 +1007,10 @@ defmodule SymphonyElixir.StatusDashboard do
   defp terminal_columns_from_env do
     case System.get_env("COLUMNS") do
       nil ->
-        fixed_running_width() + @running_row_chrome_width + @running_event_default_width
+        fixed_running_width() +
+          @running_row_chrome_width +
+          @running_title_min_width +
+          @running_action_default_width
 
       value ->
         case Integer.parse(String.trim(value)) do
@@ -827,17 +1040,6 @@ defmodule SymphonyElixir.StatusDashboard do
       value
     else
       String.slice(value, 0, width - 3) <> "..."
-    end
-  end
-
-  defp compact_session_id(nil), do: "n/a"
-  defp compact_session_id(session_id) when not is_binary(session_id), do: "n/a"
-
-  defp compact_session_id(session_id) do
-    if String.length(session_id) > 10 do
-      String.slice(session_id, 0, 4) <> "..." <> String.slice(session_id, -6, 6)
-    else
-      session_id
     end
   end
 

@@ -1139,6 +1139,29 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert message =~ "codex.stall_timeout_ms"
 
     write_workflow_file!(Workflow.workflow_file_path(),
+      observability_delivery_repository: "JovieInc/Jovie",
+      observability_delivery_history_refresh_ms: 60_000
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().observability.delivery_repository == "JovieInc/Jovie"
+    assert Config.settings!().observability.delivery_history_refresh_ms == 60_000
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      observability_delivery_repository: "invalid repository"
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "observability.delivery_repository"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      observability_delivery_history_refresh_ms: 0
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "observability.delivery_history_refresh_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},
       tracker_terminal_states: %{done: true},
       poll_interval_ms: %{bad: true},

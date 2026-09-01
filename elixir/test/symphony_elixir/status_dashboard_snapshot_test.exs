@@ -195,6 +195,23 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
   end
 
   defp render_snapshot(snapshot_data, tps) do
+    snapshot_data =
+      case snapshot_data do
+        {:ok, snapshot} ->
+          {:ok,
+           Map.put(snapshot, :artifact, %{
+             name: "symphony",
+             version: "0.0.2",
+             source_sha: "119f28a",
+             build_id: "snapshot-build",
+             built_at: "2026-09-01T15:40:00Z",
+             host: "gem"
+           })}
+
+        other ->
+          other
+      end
+
     StatusDashboard.format_snapshot_content_for_test(snapshot_data, tps, @terminal_columns)
   end
 
